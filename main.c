@@ -18,12 +18,15 @@
 #include <string.h>
 #include <unistd.h>
 #include "board_config.h"
+#include "dvp.h"
 #include "fpioa.h"
 #include "gpiohs.h"
 #include "image_process.h"
 #include "kpu.h"
 #include "lcd.h"
 #include "nt35310.h"
+#include "ov2640.h"
+#include "ov5640.h"
 #include "plic.h"
 #include "sysctl.h"
 #include "uarths.h"
@@ -42,20 +45,31 @@
 #define NUM_BUFFERS 1
 
 volatile uint32_t g_ai_done_flag;
-static image_t kpu_image[NUM_BUFFERS];
-static uint32_t lcd_gram[FRAME_WIDTH * FRAME_HEIGHT] __attribute__((aligned(32)));
+volatile uint8_t g_dvp_finish_flag;
+static image_t kpu_image, display_image;
 
 kpu_model_context_t task;
 
-INCBIN(model, "m_yolox_nano_224.kmodel");
-
-INCBIN(input, "input.bin");
-
-void set_kpu_addr_comps(image_t *image);
+INCBIN(model, "yolox_nano_224.kmodel");
 
 static void ai_done(void *ctx)
 {
     g_ai_done_flag = 1;
+}
+
+static int dvp_irq(void *ctx)
+{
+    if(dvp_get_interrupt(DVP_STS_FRAME_FINISH))
+    {
+        dvp_config_interrupt(DVP_CFG_START_INT_ENABLE | DVP_CFG_FINISH_INT_ENABLE, 0);
+        dvp_clear_interrupt(DVP_STS_FRAME_FINISH);
+        g_dvp_finish_flag = 1;
+    } else
+    {
+        dvp_start_convert();
+        dvp_clear_interrupt(DVP_STS_FRAME_START);
+    }
+    return 0;
 }
 
 #if BOARD_LICHEEDAN
@@ -170,12 +184,46 @@ int main(void)
     lcd_set_direction(DIR_YX_RLUD);
 #endif
 
+    /* DVP init */
+    printf("DVP init\n");
+#if OV5640
+    dvp_init(16);
+    dvp_set_xclk_rate(12000000);
+    dvp_enable_burst();
+    dvp_set_output_enable(0, 1);
+    dvp_set_output_enable(1, 1);
+    dvp_set_image_format(DVP_CFG_RGB_FORMAT);
+    dvp_set_image_size(FRAME_WIDTH, FRAME_WIDTH);
+    ov5640_init();
+#else
+    dvp_init(8);
+    dvp_set_xclk_rate(24000000);
+    dvp_enable_burst();
+    dvp_set_output_enable(0, 1);
+    dvp_set_output_enable(1, 1);
+    dvp_set_image_format(DVP_CFG_RGB_FORMAT);
+    dvp_set_image_size(FRAME_WIDTH, FRAME_WIDTH);
+    ov2640_init();
+#endif
+
     uint8_t *model_data_align = model_data;
-    kpu_image[0].pixel = 3;
-    kpu_image[0].width = FRAME_WIDTH;
-    kpu_image[0].height = FRAME_HEIGHT;
-    image_init(&kpu_image[0]);
-    memcpy(kpu_image[0].addr, input_data, input_size);
+    kpu_image.pixel = 3;
+    kpu_image.width = FRAME_WIDTH;
+    kpu_image.height = FRAME_WIDTH;
+    image_init(&kpu_image);
+    display_image.pixel = 2;
+    display_image.width = FRAME_WIDTH;
+    display_image.height = FRAME_WIDTH;
+    image_init(&display_image);
+    dvp_set_ai_addr((uint32_t)kpu_image.addr, (uint32_t)(kpu_image.addr + FRAME_WIDTH * FRAME_WIDTH), (uint32_t)(kpu_image.addr + FRAME_WIDTH * FRAME_WIDTH * 2));
+    dvp_set_display_addr((uint32_t)display_image.addr);
+    dvp_config_interrupt(DVP_CFG_START_INT_ENABLE | DVP_CFG_FINISH_INT_ENABLE, 0);
+    dvp_disable_auto();
+    /* DVP interrupt config */
+    printf("DVP interrupt config\n");
+    plic_set_priority(IRQN_DVP_INTERRUPT, 1);
+    plic_irq_register(IRQN_DVP_INTERRUPT, dvp_irq, NULL);
+    plic_irq_enable(IRQN_DVP_INTERRUPT);
     printf("input data uploaded\r\n");
 
     /* init face detect model */
@@ -196,35 +244,34 @@ int main(void)
     yolox_init(224, 0.1f, 0.1f, 80);
     printf("yolox init\r\n");
 
-    {
-        g_ai_done_flag = 0;
-        /* tic */
-        uint64_t kpu_start_time = sysctl_get_time_us();
-
-        kpu_run_kmodel(&task, kpu_image[0].addr, DMAC_CHANNEL5, ai_done, NULL);
-
-        while(!g_ai_done_flag)
-            ;
-
-        uint64_t kpu_end_time = sysctl_get_time_us();
-
-        float *boxes;
-        size_t output_size;
-        kpu_get_output(&task, 0, (uint8_t **)&boxes, &output_size);
-
-        /* display pic*/
-        rgb888_to_lcd(kpu_image[0].addr, lcd_gram, 224, 224);
-        lcd_draw_picture(0, 0, 224, 224, lcd_gram);
-        lcd_draw_rectangle(50, 50, 100, 100, 1, RED);
-        /* draw boxs */
-        yolox_detect(boxes, &drawboxes);
-
-        uint64_t forward_end_time = sysctl_get_time_us();
-
-        /* toc */
-        printf("model: %.03f ms , postprocess: %.03f ms \r\n", (kpu_end_time - kpu_start_time) / 1000.0, (forward_end_time - kpu_end_time) / 1000.0);
-    }
+    uint64_t time_last = sysctl_get_time_us();
+    uint64_t time_now = sysctl_get_time_us();
+    int time_count = 0;
+    float *boxes;
+    size_t output_size;
     while(1)
     {
+        g_dvp_finish_flag = 0;
+        dvp_clear_interrupt(DVP_STS_FRAME_START | DVP_STS_FRAME_FINISH);
+        dvp_config_interrupt(DVP_CFG_START_INT_ENABLE | DVP_CFG_FINISH_INT_ENABLE, 1);
+        while(g_dvp_finish_flag == 0)
+            ;
+
+        kpu_run_kmodel(&task, kpu_image.addr, DMAC_CHANNEL5, ai_done, NULL);
+        while(!g_ai_done_flag)
+            ;
+        g_ai_done_flag = 0;
+
+        kpu_get_output(&task, 0, (uint8_t **)&boxes, &output_size);
+
+        lcd_draw_picture(0, 0, 224, 224, (uint32_t *)display_image.addr);
+        yolox_detect(boxes, &drawboxes);
+        time_count++;
+        if(time_count % 100 == 0)
+        {
+            time_now = sysctl_get_time_us();
+            printf("SPF:%fms\n", (time_now - time_last) / 1000.0 / 100);
+            time_last = time_now;
+        }
     }
 }
